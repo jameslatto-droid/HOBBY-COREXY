@@ -2281,3 +2281,103 @@ Both were errors in earlier sections above, now fixed in place:
    `clear_homing_state("xyz")`. So the suggested `END_PRINT` change to `M84 X Y E` would have
    been a no-op, the existing `; keep Z enabled` comments were never true, and the pause bug
    was worse than originally described.
+
+---
+
+## Tier 2-4 Application Log — 2026-09-20
+
+Worked through every remaining tier with the printer idle, deploying and verifying each
+batch the way Tier 1 was done. Two things happened worth recording separately: an item
+that carried real motion risk was skipped by design (14, revert-only rows), and one
+active test (15) produced a definite negative result that required an immediate revert.
+
+### Applied and deployed
+
+All of Tier 2 (10-18), all of Tier 3 except the three flagged below (19, 20 no-op),
+and all of Tier 4 except 21/23/24/28/31/32 (already done or dropped) and the physical
+items. Commits `7972187` (bulk apply) and `a1a3f93` (extruder UART revert).
+
+Verification for the bulk apply matched Tier 1's method: offline parse against the same
+rules `klippy/configfile.py` uses (103 sections, 35 Jinja templates balanced, zero
+duplicate sections, zero pin conflicts after resolving `[board_pins]` aliases), every
+`_CLIENT_VARIABLE` literal checked with `ast.literal_eval` the way Klipper's
+`gcode_macro.py` actually parses `variable_*` options, and every `_CLIENT_VARIABLE`
+name cross-checked against what `mainsail.cfg`'s `PAUSE`/`RESUME`/`CANCEL_PRINT`/
+`_TOOLHEAD_PARK_PAUSE_CANCEL` macros actually read. Deployed, checksum-verified,
+`FIRMWARE_RESTART`, confirmed `ready` with no config warnings, then re-queried the
+live config for the changed values and confirmed `DUMP_TMC` still succeeds on
+`stepper_z` and `stepper_z1` after their pin un-crossing.
+
+### Item 15 — extruder UART: hypothesis tested live, falsified, reverted
+
+This one could not be left as a static "applied" edit, because it makes a claim that
+only a live test can settle, and the wrong outcome has a real failure mode. The plan
+from the summary above was executed exactly as written:
+
+1. Added `[tmc2209 extruder]` with `uart_pin: PD4`, `uart_address: 3`.
+2. Confirmed from `klippy/extras/tmc.py` before testing that `DUMP_TMC` reads
+   registers directly with no stepper-enable step, so a failed read there raises a
+   plain command error, not `invoke_shutdown` — the test genuinely could not trigger
+   the original hard-shutdown fault.
+3. Deployed, restarted, ran `DUMP_TMC STEPPER=extruder`. Failed:
+   `"Unable to read tmc uart 'extruder' register GCONF"`.
+4. Swept `uart_address` 1 and then 2 the same way (edit, deploy, restart, test).
+   **All three explicit addresses, plus the implicit default of 0, failed
+   identically.**
+
+GCONF is one of the very first registers any read touches, so this is not a
+addressing mismatch — it is a completely absent electrical link. The `uart_address`
+hypothesis from the original summary is **falsified**.
+
+<div style="color:#c0392b; border-left: 3px solid #c0392b; padding-left: 10px; margin: 8px 0;">
+
+**🔬 ASTRA SAFETY CONCERN, found while testing:** leaving `[tmc2209 extruder]` in
+place after this result would have been actively dangerous, not merely wrong.
+**Reasoning:** the connect-time init failure is logged and harmless
+(`klippy/extras/tmc.py`'s `_handle_connect()` only logs on failure), but
+`TMCErrorCheck._do_periodic_check()` re-reads driver registers once per second
+**while the motor is enabled** and calls `invoke_shutdown()` on failure. The extruder
+motor gets enabled by the very first purge-line extrusion in `START_PRINT`. So a
+non-functional `[tmc2209 extruder]` section sitting in the deployed config would have
+looked fine through every restart and every idle check, then hard-shut-down the
+printer the moment a real print actually started extruding — reproducing the exact
+fault this change was meant to fix. **Reverted immediately, before any further use of
+the printer**, restoring the standalone/Vref-pot configuration that has been the
+actual working state all along.
+
+</div>
+
+Confirmed next step, physical, mains and USB power both off (USB back-powers the MCU):
+pull the E0 driver module and compare its jumper field against a working socket (X or
+Y) — the UART-enable jumper should be fitted and no MS1/MS2 jumpers should be present
+(those set node address in UART mode on a TMC2209, which is what motivated the address
+sweep in the first place). Check the module's UART select resistor position, confirm
+the chip is actually a TMC2209 and not a TMC2208, and check whether its DIAG pin is
+cut — the same module's DIAG line shares an MCU pin (PE15) with the X endstop. If the
+jumpers and resistor look correct, swap the E0 module with the Z socket's proven-working
+one and see whether the fault follows the module (dead driver) or stays with the socket
+(board/trace fault).
+
+### Not done, and why
+
+- **`stow_on_each_sample`, item 21.** Real crash risk if the assumed pin clearance is
+  wrong — needs eyes on the machine before flipping it.
+- **`samples_tolerance_retries`, item 23.** The right value depends on a
+  `PROBE_ACCURACY` baseline that does not exist yet; setting it from a guess would
+  just replace one arbitrary number with another.
+- **`controller_fan max_power` vs `run_current`, item 24.** Needs a `DUMP_TMC`
+  `otpw` reading after a real print under load to decide which side of the tradeoff
+  to move, not a config edit made blind.
+- **The DIAG-pin inspection (item 7) and the E0 driver module inspection (item 15's
+  follow-up)** are both purely physical.
+- **Item 28** (X/Y `position_endstop` margin) was withdrawn in an earlier pass — see
+  the Tier 1 log above for why.
+- `Z_ENDSTOP_CALIBRATE`'s actual paper test (item 4) still needs a human at the
+  machine, though the macro and the persistence procedure are in place.
+
+### One correction to the original Tier 1 record
+
+The Tier 1 log above states the printer's Klipper reports `v0.13.0-745-gf0892d82b-dirty`.
+That is still accurate and unrelated to this batch — noting only that it was rechecked
+after every restart in this session and the `-dirty` suffix persisted throughout, so it
+is a standing fact about the installation, not something introduced here.

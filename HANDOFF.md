@@ -62,6 +62,31 @@ currently in the middle of a post-rebuild recalibration pass.
   triggers `invoke_shutdown`). Sweep addresses 1 and 2 if 3 fails. Only then go
   looking at the UART jumper under the E0 socket. Full reasoning and sources in
   `PRUSASLICER_PROFILE_REVIEW.md`.
+  **UPDATE 2026-09-20, later same day: hypothesis tested and falsified.**
+  Tried `[tmc2209 extruder]` with `uart_pin: PD4` live and remotely, sweeping
+  `uart_address` 0/1/2/3, restarting and running `DUMP_TMC STEPPER=extruder`
+  after each (no motor movement - confirmed safe from source first: `DUMP_TMC`
+  reads registers directly, no stepper-enable step, so a failure there is a
+  plain command error, not `invoke_shutdown`). **All four addresses failed
+  identically**: `"Unable to read tmc uart 'extruder' register GCONF"`. GCONF
+  is one of the first registers any read touches, so this is a fully absent
+  link, not a wrong node address. Reverted the section entirely - leaving it
+  in would reproduce the original hard-shutdown fault the next time the
+  extruder motor is enabled (any print's purge line), since Klipper's periodic
+  driver check would catch the dead link once the motor is running, even
+  though the connect-time failure alone is harmless. **The extruder currently
+  has no `[tmc2209]` section again**, running on the Vref pot as before -
+  this is the known-safe state, not a regression.
+  **Confirmed next step is physical**, at the machine, mains and USB both off:
+  pull the E0 driver module, compare its jumper field against a working socket
+  (X or Y) - check the UART-enable jumper is fitted and that no MS1/MS2
+  jumpers are present (those set node address in UART mode), check the
+  module's UART select resistor position, confirm it's actually a TMC2209 not
+  a TMC2208, and check whether its DIAG pin is cut (same module - PE15, X's
+  endstop, is also E0's DIAG line, see the pin-conflict note in `hardware.cfg`).
+  If all that looks right, swap the E0 module with the Z socket's (proven
+  working) module and see if the fault follows the module or stays with the
+  socket. Full test log in `hardware.cfg` and commit `a1a3f93`.
 
 ## Chronological status
 
@@ -166,6 +191,67 @@ an averaged "corrected" value — inspect/fix the hardware first, then recalibra
 - Noted in passing: the Pi's Klipper reports `v0.13.0-745-gf0892d82b-dirty`. The
   `-dirty` suffix means that checkout has uncommitted local edits, which will
   conflict on the next update.
+
+### 2026-09-20 (later still) — Tier 2-4 applied, extruder UART hypothesis tested and falsified
+
+- Worked through the rest of `PRUSASLICER_PROFILE_REVIEW.md`'s tiers with the
+  machine idle and no physical intervention, deploying and verifying each
+  batch the same way as Tier 1 (offline parse against the same rules
+  `klippy/configfile.py` uses, then checksum-verified upload, `FIRMWARE_RESTART`,
+  re-query live config, check `klippy.log`). Commits `7972187` and `a1a3f93`.
+- **Reverted X/Y `rotation_distance` 39.77→40 and Z/Z1 4.018→4.** These were
+  calibrated against a printed part's dimensions, which is a flow/extrusion
+  error, not a steps-per-mm error - belt pitch and lead screw lead are
+  geometric. Use the slicer's `xy_size_compensation` for real dimensional
+  correction instead. **Re-check a calibration cube** - absolute part size
+  shifted about 0.57% on X/Y from this revert.
+- **Un-crossed `stepper_z`/`stepper_z1`'s `dir_pin`/`enable_pin`/`uart_pin`**,
+  which were split across the Z and E1 sockets (each stepper's `step_pin` was
+  correct for its socket, but the other three pins came from the other
+  stepper's socket). Motion was unaffected throughout (neither `dir_pin` is
+  inverted and both Z motors always move together), and `DUMP_TMC` on both
+  confirmed still-working UART after the swap.
+- **Extruder UART: tested and falsified, see the corrected entry above** in
+  the hardware summary section. Section is not present in the live config.
+- Raised `max_accel` 3000→4000 (Klipper's own bisection gives 6300 as the
+  smoothing ceiling for the measured 46.2Hz Y shaper; stepped partway rather
+  than to the ceiling since the real limit is min(smoothing, ringing) and only
+  a print-based ringing test finds the latter - **still on the backlog**).
+  Also `stepper_z`/`stepper_z1` `stealthchop_threshold` 1000→0 (spreadCycle,
+  matching `interpolate: False`), `[bltouch] pin_move_time` 0.4→0.680 (default,
+  best candidate for the probe scatter `samples_tolerance_retries: 6` was
+  masking), bed mesh `fade_end` 5.0→10.0 with `fade_target: 0`, `adaptive_margin: 5`
+  added and `START_PRINT` now calls `BED_MESH_CALIBRATE ADAPTIVE=1` when the
+  gcode carries `EXCLUDE_OBJECT` markers, `gcode_arcs resolution` 0.1→1.0.
+- **Removed the `PAUSE`/`RESUME`/`CANCEL_PRINT` overrides in `macro.cfg`** that
+  were shadowing `mainsail.cfg`'s versions and silently running with a
+  mixed-file config (Klipper merges duplicate sections per-option). Added
+  `[gcode_macro _CLIENT_VARIABLE]` configuring the upstream macros instead,
+  every option cross-checked by name against what `mainsail.cfg` actually
+  reads - this restores idle-timeout extension during a pause, temperature
+  restore on resume, and park-height clamping. **Test a real pause and resume**
+  before trusting this on an important print.
+- `START_PRINT` now sets a known gcode state (`G90`/`M83`/`M107`) up front and
+  preheats the nozzle to `max(target-60, 150)` before homing instead of full
+  target, so it isn't oozing at temperature through mesh load.
+- Removed duplicate `[virtual_sdcard]`/`[pause_resume]`/`[display_status]`/
+  `[respond]` sections from `system.cfg` (already provided by `mainsail.cfg`),
+  and the stale "Pressure Advance ... 0.06" comment block from `printer.cfg`.
+- **PrusaSlicer** (`%APPDATA%\PrusaSlicer`, untracked): `gcode_label_objects`
+  octoprint→firmware (native `EXCLUDE_OBJECT_*` instead of comments needing
+  Moonraker reprocessing - paired with `moonraker.conf`'s
+  `enable_object_processing` True→False, which needs a **Moonraker service
+  restart**, not just `FIRMWARE_RESTART`, to take effect); `fill_density`
+  0%→10% (0% was bypassing `ensure_vertical_shell_thickness` per PrusaSlicer's
+  own source); `overhang_speed_0..3` 15/15/20/25→15/25/30/80% (Prusa's own
+  MK4IS curve). `enable_dynamic_overhang_speeds` deliberately left at 0 - a
+  preference call, not a fix.
+- **Still deferred to physical intervention**, unchanged from the Tier 1 list:
+  `Z_ENDSTOP_CALIBRATE` paper test, DIAG-pin inspection on E0/E1, plus now also
+  `stow_on_each_sample` (needs verified pin clearance before enabling),
+  `samples_tolerance_retries` (needs a `PROBE_ACCURACY` baseline first),
+  `controller_fan max_power` vs `run_current` (needs a `DUMP_TMC` `otpw` check
+  after a real print), and the E0 driver module inspection above.
 
 ## Current known-good config values
 
