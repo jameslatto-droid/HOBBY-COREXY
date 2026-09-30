@@ -17,6 +17,13 @@ currently in the middle of a post-rebuild recalibration pass.
 - Config lives on the printer's Raspberry Pi at `/home/pi/printer_data/config/`,
   mirrored in this repo's `config/` folder.
 - SSH alias `klipper` → the Pi (key-based auth, no password prompt needed).
+- Multiple keys are authorized on the Pi's `~/.ssh/authorized_keys`: the
+  original dev-box key (`corexy_ed25519`, private half never leaves that
+  machine) and `corexy_secondmachine_ed25519` (public half committed at
+  `corexy_secondmachine_ed25519.pub` in repo root) for a second Windows
+  machine. Private keys are never committed — see repo root for the public
+  half and get the matching private key via an out-of-band secure transfer,
+  not git.
 - Moonraker HTTP API on the Pi at `http://127.0.0.1:7125` (call it via
   `ssh klipper "curl -s ..."` from a dev machine — there's no port forward set up
   locally). Gcode script endpoint: `POST /printer/gcode/script -d 'script=<cmd>'`.
