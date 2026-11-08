@@ -1,0 +1,31 @@
+[Unit]
+Description=OpenAI Secure MCP Tunnel for HOBBY-COREXY Printer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=james
+Group=james
+WorkingDirectory=@@REPO_ROOT@@
+Environment=HOME=/home/james
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PATH=/home/james/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/etc/jl-system/hobby-printer-tunnel.env
+EnvironmentFile=/home/james/.config/hobby-printer-mcp.env
+ExecStart=/home/james/.local/bin/tunnel-client run --profile-file /home/james/.config/tunnel-client/jlprinter.yaml
+Restart=always
+RestartSec=5
+TimeoutStartSec=120
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=/home/james/.ssh
+ReadWritePaths=/srv/data/3D-Printing/PrusaSlicer/production/printer
+ReadWritePaths=/srv/data/3D-Printing/PrusaSlicer/production/physical_printer
+ReadWritePaths=/srv/data/3D-Printing/PrusaSlicer/production/print
+ReadWritePaths=/srv/data/3D-Printing/PrusaSlicer/production/filament
+
+[Install]
+WantedBy=multi-user.target
