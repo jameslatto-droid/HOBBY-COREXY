@@ -11,10 +11,16 @@ does not use Brain as a filesystem proxy.
   vendor presets. Git metadata and backup files are excluded.
 - Read `printer.cfg` and the `.cfg` files it includes, including the two
   in-home Mainsail/timelapse symlink targets. Moonraker settings are not
-  exposed.
+  exposed. Optionally list/read unreferenced `.cfg` files to inspect new
+  configurations before including them.
 - Preview a full-file replacement before applying it. Apply requires the
   current SHA-256, the preview's confirmation token, and `confirmed=true`.
   A timestamped backup is retained. Symlinked config files are read-only.
+- Preview and confirm creation of new `.ini` user profiles or unreferenced
+  Klipper `.cfg` files. Existing files are never overwritten.
+- Preview and confirm deletion of `.ini` user profiles or unreferenced
+  Klipper `.cfg` files, retaining a verified recovery backup. `printer.cfg`,
+  referenced configs, symlinks, and backups cannot be deleted.
 - Never run remote shell commands, reload Klipper, move or heat the printer,
   or start a print.
 - Secret-like settings are redacted; a file containing such a setting cannot

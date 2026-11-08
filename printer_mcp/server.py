@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import difflib
+import errno
+import fnmatch
 import hashlib
 import logging
 import os
@@ -8,6 +10,8 @@ import posixpath
 import re
 import stat
 import tempfile
+import threading
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -129,7 +133,7 @@ def _safe_config_name(filename: str) -> str:
         or "\\" in filename
         or _is_backup(filename)
     ):
-        raise ValueError("Only active, included Klipper .cfg filenames are allowed.")
+        raise ValueError("Only plain Klipper .cfg filenames are allowed.")
     return filename
 
 
@@ -149,8 +153,13 @@ def _confirmation_token(
 class PrinterMcp:
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or Settings.from_env()
+        self._file_proposals: dict[str, tuple[float, tuple[str, ...]]] = {}
+        self._proposal_lock = threading.Lock()
 
-    def _local_path(self, category: str, filename: str, *, writing: bool = False) -> Path:
+    def _local_path(
+        self, category: str, filename: str, *, writing: bool = False,
+        creating: bool = False,
+    ) -> Path:
         if category not in CATEGORY_DIRS:
             raise ValueError(f"Unknown PrusaSlicer category: {category}")
         if (
@@ -176,6 +185,10 @@ class PrinterMcp:
         path = directory / filename
         if path.is_symlink():
             raise ValueError("Symbolic links are not exposed through the MCP.")
+        if creating:
+            if path.exists():
+                raise FileExistsError("The profile already exists; use preview_config_update.")
+            return path
         resolved = path.resolve(strict=True)
         if not resolved.is_relative_to(root) or not resolved.is_file():
             raise ValueError("Profile is not a regular file inside the configured data directory.")
@@ -355,9 +368,31 @@ class PrinterMcp:
                 pending.append(_safe_config_name(include_name))
         return sorted(discovered)
 
-    def list_klipper_config_files(self) -> list[dict[str, Any]]:
+    def _remote_config_names(self, sftp: paramiko.SFTPClient) -> list[str]:
+        return sorted(
+            entry.filename
+            for entry in sftp.listdir_attr(str(self.settings.remote_config_dir))
+            if CONFIG_NAME_RE.fullmatch(entry.filename)
+            and ".." not in entry.filename
+            and not _is_backup(entry.filename)
+        )
+
+    def _require_unreferenced(self, sftp: paramiko.SFTPClient, filename: str) -> None:
+        if filename == "printer.cfg":
+            raise ValueError("printer.cfg cannot be created or deleted through these tools.")
+        for source in self._remote_config_names(sftp):
+            text = self._read_sftp_file(sftp, source).decode("utf-8")
+            for line in text.splitlines():
+                match = INCLUDE_RE.match(line)
+                if match and fnmatch.fnmatchcase(filename, match.group(1).strip()):
+                    raise ValueError(f"The file is referenced by {source}; remove its include first.")
+
+    def list_klipper_config_files(
+        self, include_unreferenced: bool = False
+    ) -> list[dict[str, Any]]:
         with self._sftp() as sftp:
-            names = self._klipper_config_names(sftp)
+            active = self._klipper_config_names(sftp)
+            names = self._remote_config_names(sftp) if include_unreferenced else active
             result = []
             for filename in names:
                 _, attrs, is_symlink = self._resolve_remote_config(sftp, filename)
@@ -368,15 +403,18 @@ class PrinterMcp:
                         "size_bytes": len(data),
                         "sha256": _sha256(data),
                         "writable": not is_symlink,
+                        "included": filename in active,
                         "modified": int(attrs.st_mtime),
                     }
                 )
             return result
 
-    def read_klipper_config(self, filename: str) -> dict[str, Any]:
+    def read_klipper_config(
+        self, filename: str, include_unreferenced: bool = False
+    ) -> dict[str, Any]:
         with self._sftp() as sftp:
             allowed = self._klipper_config_names(sftp)
-            if filename not in allowed:
+            if filename not in allowed and not include_unreferenced:
                 raise ValueError("Only active files included by printer.cfg are available.")
             _, attrs, is_symlink = self._resolve_remote_config(sftp, filename)
             data = self._read_sftp_file(sftp, filename)
@@ -387,6 +425,7 @@ class PrinterMcp:
             "content": _redact(text),
             "redacted": _has_sensitive_lines(text),
             "writable": not is_symlink,
+            "included": filename in allowed,
             "modified": int(attrs.st_mtime),
         }
 
@@ -541,7 +580,7 @@ class PrinterMcp:
                 temp_created = False
                 original_moved = False
                 try:
-                    with sftp.open(backup_path, "xb") as backup_file:
+                    with sftp.open(backup_path, "wxb") as backup_file:
                         backup_file.write(current)
                     backup_created = True
                     sftp.chmod(backup_path, mode)
@@ -594,6 +633,238 @@ class PrinterMcp:
             "printer_restarted": False,
         }
 
+    def _file_proposal(
+        self, operation: str, target: str, category: str, filename: str, digest: str,
+        confirmation_token: str | None = None, confirmed: bool = False,
+    ) -> str:
+        with self._proposal_lock:
+            now = time.monotonic()
+            self._file_proposals = {
+                token: proposal for token, proposal in self._file_proposals.items()
+                if proposal[0] > now
+            }
+            binding = (operation, target, category, filename, digest)
+            if confirmation_token is not None:
+                if confirmed is not True:
+                    raise ValueError("Explicit confirmation is required after reviewing the preview.")
+                proposal = self._file_proposals.get(confirmation_token)
+                if proposal is None or proposal[1] != binding:
+                    raise ValueError("Preview token is expired, used, or does not match this operation.")
+                del self._file_proposals[confirmation_token]
+                return confirmation_token
+            if len(self._file_proposals) >= 100:
+                raise ValueError("Too many pending previews; wait for them to expire.")
+            token = uuid.uuid4().hex
+            self._file_proposals[token] = (now + 600, binding)
+            return token
+
+    def _lifecycle_local_path(
+        self, category: str, filename: str, *, creating: bool = False
+    ) -> Path:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_. -]*\.ini", filename) or ".." in filename:
+            raise ValueError("Profile creation/deletion requires a plain .ini user-profile filename.")
+        if category not in PROFILE_CATEGORIES:
+            raise ValueError("Only user-profile categories support creation/deletion.")
+        if (self.settings.local_root / CATEGORY_DIRS[category]).is_symlink():
+            raise ValueError("Symlinked profile directories cannot be changed through these tools.")
+        return self._local_path(category, filename, writing=True, creating=creating)
+
+    def _require_remote_missing(self, sftp: paramiko.SFTPClient, filename: str) -> None:
+        path = self._remote_path(filename)
+        try:
+            sftp.lstat(path)
+        except OSError as error:
+            if error.errno != errno.ENOENT:
+                raise
+        else:
+            raise FileExistsError("The config already exists; use preview_config_update.")
+        self._require_unreferenced(sftp, filename)
+
+    def preview_config_create(
+        self, target: str, category: str, filename: str, content: str
+    ) -> dict[str, Any]:
+        data = _validate_replacement(content)
+        if _has_sensitive_lines(content):
+            raise ValueError("Sensitive settings cannot be created through the MCP.")
+        if target == "prusaslicer":
+            self._lifecycle_local_path(category, filename, creating=True)
+        elif target == "klipper":
+            if category:
+                raise ValueError("Use an empty category for Klipper.")
+            with self._sftp() as sftp:
+                self._require_remote_missing(sftp, filename)
+        else:
+            raise ValueError("Target must be 'prusaslicer' or 'klipper'.")
+        digest = _sha256(data)
+        return {
+            "target": target, "category": category, "filename": filename,
+            "sha256": digest,
+            "confirmation_token": self._file_proposal(
+                "create", target, category, filename, digest
+            ),
+            "diff": "".join(difflib.unified_diff(
+                [], content.splitlines(keepends=True),
+                fromfile="/dev/null", tofile=f"proposed/{filename}",
+            )),
+            "expires_in_seconds": 600,
+            "apply_requires_explicit_confirmation": True,
+            "automatically_activated": False,
+        }
+
+    def apply_config_create(
+        self, target: str, category: str, filename: str, content: str,
+        confirmation_token: str, confirmed: bool = False,
+    ) -> dict[str, Any]:
+        data = _validate_replacement(content)
+        if _has_sensitive_lines(content):
+            raise ValueError("Sensitive settings cannot be created through the MCP.")
+        digest = _sha256(data)
+        self._file_proposal(
+            "create", target, category, filename, digest, confirmation_token, confirmed
+        )
+        if target == "prusaslicer":
+            path = self._lifecycle_local_path(category, filename, creating=True)
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{filename}.printer-mcp-", suffix=".tmp", dir=path.parent
+            )
+            try:
+                with os.fdopen(fd, "wb") as temp_file:
+                    temp_file.write(data)
+                    temp_file.flush()
+                    os.fsync(temp_file.fileno())
+                os.chmod(temp_name, 0o644)
+                os.link(temp_name, path)
+            finally:
+                os.unlink(temp_name)
+        elif target == "klipper":
+            with self._sftp() as sftp:
+                self._require_remote_missing(sftp, filename)
+                path = self._remote_path(filename)
+                temp_path = posixpath.join(
+                    str(self.settings.remote_config_dir),
+                    f".{filename}.printer-mcp-{uuid.uuid4().hex}.tmp",
+                )
+                temp_created = False
+                try:
+                    with sftp.open(temp_path, "wxb") as remote_file:
+                        temp_created = True
+                        remote_file.write(data)
+                    sftp.chmod(temp_path, 0o644)
+                    with sftp.open(temp_path, "rb") as remote_file:
+                        if remote_file.read(MAX_FILE_BYTES + 1) != data:
+                            raise ValueError("Remote create read-back failed; no config was installed.")
+                    self._require_remote_missing(sftp, filename)
+                    sftp.rename(temp_path, path)
+                except (OSError, ValueError):
+                    if temp_created:
+                        sftp.remove(temp_path)
+                    raise
+        else:
+            raise ValueError("Target must be 'prusaslicer' or 'klipper'.")
+        return {
+            "target": target, "category": category, "filename": filename,
+            "created": True, "sha256": digest, "printer_restarted": False,
+            "automatically_activated": False,
+        }
+
+    def _deletion_content(
+        self, target: str, category: str, filename: str,
+        sftp: paramiko.SFTPClient | None = None,
+    ) -> tuple[bytes, Path | None]:
+        if target == "prusaslicer":
+            path = self._lifecycle_local_path(category, filename)
+            data = path.read_bytes()
+        elif target == "klipper":
+            if category:
+                raise ValueError("Use an empty category for Klipper.")
+            if sftp is None:
+                with self._sftp() as connection:
+                    return self._deletion_content(target, category, filename, connection)
+            self._resolve_remote_config(sftp, filename, writing=True)
+            self._require_unreferenced(sftp, filename)
+            data = self._read_sftp_file(sftp, filename)
+            path = None
+        else:
+            raise ValueError("Target must be 'prusaslicer' or 'klipper'.")
+        if len(data) > MAX_FILE_BYTES:
+            raise ValueError("File exceeds the deletion read limit.")
+        if _has_sensitive_lines(data.decode("utf-8")):
+            raise ValueError("Sensitive settings make this file read-only through the MCP.")
+        return data, path
+
+    def preview_config_delete(
+        self, target: str, category: str, filename: str, expected_sha256: str
+    ) -> dict[str, Any]:
+        data, _ = self._deletion_content(target, category, filename)
+        digest = _sha256(data)
+        if digest != expected_sha256.lower():
+            raise ValueError("The file changed; read it again before previewing deletion.")
+        return {
+            "target": target, "category": category, "filename": filename,
+            "expected_sha256": digest,
+            "confirmation_token": self._file_proposal(
+                "delete", target, category, filename, digest
+            ),
+            "diff": "".join(difflib.unified_diff(
+                data.decode("utf-8").splitlines(keepends=True), [],
+                fromfile=f"current/{filename}", tofile="/dev/null",
+            )),
+            "expires_in_seconds": 600,
+            "backup_will_be_retained": True,
+            "apply_requires_explicit_confirmation": True,
+        }
+
+    def apply_config_delete(
+        self, target: str, category: str, filename: str, expected_sha256: str,
+        confirmation_token: str, confirmed: bool = False,
+    ) -> dict[str, Any]:
+        digest = expected_sha256.lower()
+        self._file_proposal(
+            "delete", target, category, filename, digest, confirmation_token, confirmed
+        )
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup_name = f"{filename}.before-printer-mcp-delete-{stamp}-{uuid.uuid4().hex[:8]}"
+        if target == "prusaslicer":
+            data, path = self._deletion_content(target, category, filename)
+            if _sha256(data) != digest:
+                raise ValueError("The file changed since preview; nothing was deleted.")
+            if path is None:
+                raise ValueError("Missing local deletion path.")
+            backup = path.with_name(backup_name)
+            with backup.open("xb") as backup_file:
+                backup_file.write(data)
+                backup_file.flush()
+                os.fsync(backup_file.fileno())
+            os.chmod(backup, stat.S_IMODE(path.stat().st_mode))
+            current, _ = self._deletion_content(target, category, filename)
+            if _sha256(current) != digest or backup.read_bytes() != data:
+                raise ValueError("Deletion verification failed; original and backup were retained.")
+            path.unlink()
+        elif target == "klipper":
+            with self._sftp() as sftp:
+                data, _ = self._deletion_content(target, category, filename, sftp)
+                if _sha256(data) != digest:
+                    raise ValueError("The file changed since preview; nothing was deleted.")
+                path = self._remote_path(filename)
+                backup = posixpath.join(str(self.settings.remote_config_dir), backup_name)
+                with sftp.open(backup, "wxb") as backup_file:
+                    backup_file.write(data)
+                sftp.chmod(backup, stat.S_IMODE(sftp.lstat(path).st_mode))
+                with sftp.open(backup, "rb") as backup_file:
+                    if backup_file.read(MAX_FILE_BYTES + 1) != data:
+                        raise ValueError("Backup verification failed; original was not deleted.")
+                current, _ = self._deletion_content(target, category, filename, sftp)
+                if _sha256(current) != digest:
+                    raise ValueError("The file changed during deletion; original was retained.")
+                sftp.remove(path)
+        else:
+            raise ValueError("Target must be 'prusaslicer' or 'klipper'.")
+        return {
+            "target": target, "category": category, "filename": filename,
+            "deleted": True, "backup": backup_name, "sha256": digest,
+            "printer_restarted": False,
+        }
+
 
 server = PrinterMcp()
 mcp = FastMCP("HOBBY-COREXY Printer")
@@ -618,15 +889,17 @@ def search_local_profiles(query: str, category: str = "all") -> dict[str, Any]:
 
 
 @mcp.tool()
-def list_klipper_config_files() -> list[dict[str, Any]]:
-    """List printer.cfg and recursively included Klipper .cfg files on the Pi. Backups and Moonraker settings are excluded."""
-    return server.list_klipper_config_files()
+def list_klipper_config_files(include_unreferenced: bool = False) -> list[dict[str, Any]]:
+    """List active Klipper includes. Set include_unreferenced=true to also inspect staged .cfg files in the config folder. Backups and Moonraker settings are excluded."""
+    return server.list_klipper_config_files(include_unreferenced)
 
 
 @mcp.tool()
-def read_klipper_config(filename: str) -> dict[str, Any]:
-    """Read an active Klipper config included from printer.cfg. Secret-like values are redacted."""
-    return server.read_klipper_config(filename)
+def read_klipper_config(
+    filename: str, include_unreferenced: bool = False
+) -> dict[str, Any]:
+    """Read an active Klipper config. Set include_unreferenced=true for a staged .cfg file. Secret-like values are redacted."""
+    return server.read_klipper_config(filename, include_unreferenced)
 
 
 @mcp.tool()
@@ -662,6 +935,44 @@ def apply_config_update(
         replacement_content,
         confirmation_token,
         confirmed,
+    )
+
+
+@mcp.tool()
+def preview_config_create(
+    target: str, category: str, filename: str, content: str
+) -> dict[str, Any]:
+    """Preview creating a new .ini user profile or unreferenced Klipper .cfg. Target: prusaslicer or klipper; category is empty for klipper. Never includes/activates a config."""
+    return server.preview_config_create(target, category, filename, content)
+
+
+@mcp.tool()
+def apply_config_create(
+    target: str, category: str, filename: str, content: str,
+    confirmation_token: str, confirmed: bool = False,
+) -> dict[str, Any]:
+    """Create the exact previewed file with explicit user confirmation and its unused 10-minute token. Refuses existing files. Does not activate configs or restart Klipper."""
+    return server.apply_config_create(
+        target, category, filename, content, confirmation_token, confirmed
+    )
+
+
+@mcp.tool()
+def preview_config_delete(
+    target: str, category: str, filename: str, expected_sha256: str
+) -> dict[str, Any]:
+    """Preview deletion of a .ini user profile or unreferenced Klipper .cfg. Requires current hash; forbids printer.cfg, referenced configs, symlinks, and backups."""
+    return server.preview_config_delete(target, category, filename, expected_sha256)
+
+
+@mcp.tool()
+def apply_config_delete(
+    target: str, category: str, filename: str, expected_sha256: str,
+    confirmation_token: str, confirmed: bool = False,
+) -> dict[str, Any]:
+    """Delete the exact previewed file after explicit user confirmation with current hash and unused 10-minute token. Retains a verified recovery backup. Never restarts Klipper."""
+    return server.apply_config_delete(
+        target, category, filename, expected_sha256, confirmation_token, confirmed
     )
 
 

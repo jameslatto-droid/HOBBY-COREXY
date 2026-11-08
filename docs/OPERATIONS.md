@@ -13,7 +13,8 @@ The MCP reads:
   `/srv/data/3D-Printing/PrusaSlicer/production`;
 - active Klipper `.cfg` includes under the configured Pi config directory,
   plus only symlink targets beneath the Pi's Mainsail and timelapse config
-  directories.
+  directories; opt-in `include_unreferenced=true` on list/read also exposes
+  staged `.cfg` files directly in that config directory.
 
 It does not read `.git`, backups, `moonraker.conf`, arbitrary Pi paths, or
 PrusaSlicer's app preferences for updates. SSH is pinned to the host key in
@@ -65,7 +66,7 @@ unit. It installs and starts only this printer tunnel. Check it with:
 
 ```bash
 systemctl status jl-printer-mcp-tunnel.service --no-pager
-/home/james/.local/bin/tunnel-client health --listen-addr 127.0.0.1:18084
+/home/james/.local/bin/tunnel-client health --url http://127.0.0.1:18084 --require-control-plane-poll
 ```
 
 Add the resulting tunnel endpoint as a separate ChatGPT connector. Do not
@@ -84,6 +85,46 @@ PrusaSlicer profile writes are limited to the active user `printer`,
 writes are limited to regular files included from `printer.cfg`; symlinked
 Mainsail/timelapse files are read-only. No action tool for print, motion,
 heater, or restart operations exists.
+
+### Create and delete
+
+Use `preview_config_create` then `apply_config_create` with identical target,
+category, filename, content, the returned token, and `confirmed=true`.
+Creation supports only new `.ini` files in the four user-profile directories
+or new plain `.cfg` files directly in the Pi config directory. Creation is
+exclusive: it cannot replace an existing file or symlink. New Klipper files
+must be unreferenced, including by wildcard includes; creation never changes
+`printer.cfg`, adds an include, or restarts Klipper. Profiles become visible
+to PrusaSlicer but are not selected by this service.
+
+For a new Klipper file, list/read with `include_unreferenced=true`. The
+default list/read remains active-includes-only. Existing replacement tools
+remain restricted to active includes: review and explicitly add the include
+before using them for a staged Klipper file.
+
+For deletion, first read the file, then use `preview_config_delete` and
+`apply_config_delete` with the current SHA-256, returned token, and
+`confirmed=true`. Deletion is restricted to `.ini` user profiles and
+unreferenced regular Klipper `.cfg` files. `printer.cfg`, files referenced by
+any directly listed config (including inactive configs and wildcard
+includes), symlinks, app/vendor files, backups, and files with secret-like
+settings are protected. Remove references explicitly before proposing a
+Klipper deletion. Both locations retain and verify a timestamped backup
+before deleting the original.
+
+Create/delete tokens are random, bound to the exact operation and content
+hash, expire after ten minutes, and are consumed by an apply attempt.
+Restarting the MCP invalidates pending previews. Failed applies need a new
+preview; inspect the current file first. Backups retained on failure are
+intentional recovery evidence, not success.
+
+Do not edit the same files concurrently in PrusaSlicer, the printer UI, or
+another client. Hash/reference checks reject observed drift but are not
+distributed filesystem locks.
+
+After a code update, restart only `jl-printer-mcp-tunnel.service` and refresh
+the ChatGPT connector catalogue to discover new tools. This does not restart
+Klipper.
 
 ## Rollback
 

@@ -8,8 +8,11 @@
 ```
 
 The tests cover path confinement, backup exclusion, redaction, preview
-confirmation, stale-hash rejection, and backup creation. They do not write to
-the live printer.
+confirmation, stale-hash rejection, and backup creation. Local and fake-SFTP
+fixtures also cover create/read/delete, exclusive creation, expired/consumed
+tokens, protected references, symlinks, remote failures, and the SFTP write
+flag required for exclusive backup creation. They do not write to the live
+printer.
 
 ## Live read-only acceptance
 
@@ -21,8 +24,32 @@ With the restricted SFTP key installed and the printer reachable:
 3. `read_klipper_config` returns no unredacted secret-like values.
 4. A preview is non-writing; an apply without `confirmed=true`, a matching
    confirmation token, or the expected SHA-256 is rejected.
-5. A confirmed disposable profile-fixture update creates a backup. Never run
-   a write acceptance test against the live printer config.
+5. A confirmed disposable profile-fixture update creates a backup. Never
+   replace or delete an existing live printer config as a write test.
+
+## Explicit live create/delete acceptance
+
+Only with operator authorization, use comment-only uniquely named `.ini` and
+`.cfg` files for live tests. Do not add a Klipper include or select a profile.
+Use the MCP preview/create/read/preview-delete/delete sequence, check the
+returned hashes against the test content, and verify the original filenames
+are absent afterward. Read the new Klipper file with
+`include_unreferenced=true`. Verify both recovery backups match the test
+content and all pre-existing active config hashes remain unchanged. Retain
+the deletion backups; do not remove production evidence to clean a test.
+
+The repeatable stdio MCP check is:
+
+```bash
+set -a
+. /home/james/.config/hobby-printer-mcp.env
+set +a
+.venv/bin/python scripts/verify-file-lifecycle.py --live
+```
+
+This exercises the real MCP transport and live SFTP key, not a raw
+filesystem workaround. The explicit `--live` flag authorizes only creation
+and deletion of the script's unique disposable filenames.
 
 ## Tunnel acceptance
 
